@@ -1,6 +1,7 @@
 // lib/chat-storage.ts
 
 import {
+    chatDb,
     initChatDb,
     dbPutMessage, dbDeleteMessage, dbDeleteMessagesBySession, dbDeleteMessagesByIds,
     dbPutMessages, dbPutSessions, dbPutContacts, dbDeleteSession,
@@ -56,6 +57,15 @@ export type ChatSession = {
     offlineBilingualTranslationPrompt?: string;
     nativeExpandedToolSourceIds?: string[];
     visionImagePromptLimit?: number;
+    /** 流式生成（线上）：开启后该会话的线上 AI 回复边生成边显示（默认关，保持原整段请求行为） */
+    streamOnline?: boolean;
+    /** 流式生成（线下）：开启后该会话的线下 AI 回复边生成边显示（默认关，保持原整段请求行为） */
+    streamOffline?: boolean;
+    /**
+     * 线下摘要自动补提：模型没写 <summary> 时再发一次小请求让它补。默认开；
+     * 关掉就只调一次 API，那一轮没摘要（不进短期记忆的事件流）。按次计费的接口想省一半调用时关它。
+     */
+    offlineSummaryRetry?: boolean;
     // Group chat fields
     isGroup?: boolean;
     groupName?: string;
@@ -224,6 +234,7 @@ export type ChatMessage = {
     };
     isTyping?: boolean; // temporary flag for UI rendering
     statusPanel?: string; // AI display-only status content from [状态栏] tags
+    statusRegionMode?: "custom"; // 该消息生成时会话处于自定义状态栏模式（缺省=原生渲染）
     innerMonologue?: string; // AI inner monologue content from [内心] tags
     reasoningText?: string; // 模型思维链（reasoning/CoT）内容，挂在回复批次的第一条气泡上
     stateValues?: StateValue[]; // parsed character state values from inner monologue
@@ -241,6 +252,8 @@ export type ChatMessage = {
         externalId?: string;
         direction?: "inbound" | "outbound" | "local";
         syncedAt?: string;
+        /** 云端主动回复对应的本地触发消息，用于跨时钟因果排序。 */
+        replyAfterLocalMessageId?: string;
     };
     // Group chat fields
     senderCharacterId?: string; // which character sent this assistant message in a group chat
@@ -254,12 +267,30 @@ export type ChatAppSettings = {
     quickActionEnabled?: boolean; // When true, show the floating quick action entry
     browserNotificationsEnabled?: boolean; // When true, send browser Notification API alerts when page is hidden
     enterToSendEnabled?: boolean; // When true, Enter sends chat input and Shift+Enter inserts a newline
+    callVibrationEnabled?: boolean; // 语音/视频来电等待接听时循环振动（默认开；iOS 网页不支持振动则无效果）
+    maxToolRounds?: number; // 单条消息的工具循环轮数上限（默认 5；每轮=一次模型请求，轮内调用条数不限）
+    floatingDockEnabled?: boolean; // 悬浮球贴边半隐藏收拢模式（默认关）
 };
+
+/** 单条消息工具循环轮数上限（默认 5，夹在 1–20 之间） */
+export function getMaxToolRounds(): number {
+    const raw = loadChatAppSettings().maxToolRounds;
+    if (typeof raw !== "number" || !Number.isFinite(raw)) return 5;
+    return Math.max(1, Math.min(20, Math.round(raw)));
+}
+
+/** 会话是否开启线上流式生成（默认关；按会话独立控制，单聊/群聊都生效） */
+export function isSessionStreamingEnabled(session: Pick<ChatSession, "streamOnline" | "streamOffline"> | null | undefined, online: boolean): boolean {
+    if (!session) return false;
+    return online ? session.streamOnline === true : session.streamOffline === true;
+}
 
 export const CHAT_APP_SETTINGS_UPDATED_EVENT = "chat-app-settings-updated";
 export const CHAT_MESSAGE_PUSHED_EVENT = "chat-message-pushed";
 export const CHAT_MESSAGES_DELETED_EVENT = "chat-messages-deleted";
 export const CHAT_REQUEST_REPLY_EVENT = "chat-request-reply";
+/** 长按编辑整批回复后重建消息：携带新消息与编辑后的原文，供云同步回写。 */
+export const CHAT_RESPONSE_BATCH_REPLACED_EVENT = "chat-response-batch-replaced";
 
 // ── Media Preview Map ─────────────────────────
 const MEDIA_PREVIEW_MAP: Record<string, string> = {
@@ -520,6 +551,7 @@ const DEFAULT_CHAT_APP_SETTINGS: ChatAppSettings = {
     promptViewerEnabled: false,
     quickActionEnabled: false,
     enterToSendEnabled: false,
+    floatingDockEnabled: false,
 };
 
 // ── In-Memory Caches (hydrated from IndexedDB on startup) ──────────
@@ -1076,6 +1108,23 @@ export function deleteChatSession(sessionId: string) {
     clearChatSessionMessages(sessionId); // Cleanup associated messages
 }
 
+// 把一个会话的全部消息挪到另一个会话名下（重复会话合并用）。
+// 两边的 order 序号各自从 0 起，直接混排会串位，挪完后按时间重排目标会话。
+export function reassignChatSessionMessages(fromSessionId: string, toSessionId: string): number {
+    if (fromSessionId === toSessionId) return 0;
+    const changed: ChatMessage[] = [];
+    _messagesCache = _messagesCache.map(message => {
+        if (message.sessionId !== fromSessionId) return message;
+        const updated = { ...message, sessionId: toSessionId };
+        changed.push(updated);
+        return updated;
+    });
+    if (changed.length === 0) return 0;
+    dbPutMessages(changed);
+    reindexSessionMessageOrdersByTime(toSessionId);
+    return changed.length;
+}
+
 // ── CRUD for Messages ─────────────────────────
 export function loadChatMessages(sessionId: string, limit?: number): ChatMessage[] {
     const all = getSortedSessionMessages(sessionId);
@@ -1099,11 +1148,14 @@ export function createToolExecutionId(): string {
     return `toolrun_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
-export function pushChatMessage(msg: Omit<ChatMessage, "id" | "createdAt" | "status"> & { status?: ChatMessageStatus }): ChatMessage {
+export function pushChatMessage(msg: Omit<ChatMessage, "id" | "createdAt" | "status"> & {
+    status?: ChatMessageStatus;
+    createdAt?: string;
+}): ChatMessage {
     let newMsg: ChatMessage = {
         ...msg,
         id: createMessageId(),
-        createdAt: new Date().toISOString(),
+        createdAt: msg.createdAt || new Date().toISOString(),
         order: getNextMessageOrder(msg.sessionId),
         status: msg.status || "sent"
     };
@@ -1118,16 +1170,26 @@ export function pushChatMessage(msg: Omit<ChatMessage, "id" | "createdAt" | "sta
     dbPutMessage(newMsg);
 
     // Auto update session last message only for records that can produce a list preview.
+    // 优化：直接增量更新内存会话缓存并异步写单条，避免每次发送都走 loadChatSessions +
+    // saveChatSessions 触发全量会话预览重算（会话/消息多了以后会明显卡顿）。
     const preview = getChatMessagePreview(newMsg);
-    const sessions = loadChatSessions();
-    const sessIdx = sessions.findIndex(s => s.id === msg.sessionId);
+    const sessIdx = _sessionsCache.findIndex(s => s.id === msg.sessionId);
     if (sessIdx !== -1 && isSessionPreviewCandidate(newMsg)) {
-        sessions[sessIdx].lastMessageId = newMsg.id;
-        if (preview) {
-            sessions[sessIdx].lastMessagePreview = preview;
+        const target = _sessionsCache[sessIdx];
+        target.lastMessageId = newMsg.id;
+        if (preview) target.lastMessagePreview = preview;
+        target.updatedAt = newMsg.createdAt;
+        dbPutSessions([target]);
+    } else if (sessIdx === -1) {
+        // 缓存未命中（极端情况）：回退全量路径，保证列表预览仍会刷新
+        const sessions = loadChatSessions();
+        const idx2 = sessions.findIndex(s => s.id === msg.sessionId);
+        if (idx2 !== -1 && isSessionPreviewCandidate(newMsg)) {
+            sessions[idx2].lastMessageId = newMsg.id;
+            if (preview) sessions[idx2].lastMessagePreview = preview;
+            sessions[idx2].updatedAt = newMsg.createdAt;
+            saveChatSessions(sessions);
         }
-        sessions[sessIdx].updatedAt = newMsg.createdAt;
-        saveChatSessions(sessions);
     }
 
     if (typeof window !== "undefined") {
@@ -1700,6 +1762,41 @@ export function updateMessageMediaUrl(messageId: string, mediaUrl: string) {
     }
 }
 
+/**
+ * 语音合成结果落库：优先走内存缓存（当前会话可见时同步生效）；缓存里没有
+ * （合成期间用户已切走会话）就直接读库改库——合成一次的音频绝不能丢，
+ * 丢了就是下一次白花钱的重新合成。
+ */
+export async function persistMessageVoiceAudio(
+    messageId: string,
+    mediaUrl: string,
+    synthesizedFromText: string,
+): Promise<void> {
+    const idx = _messagesCache.findIndex(m => m.id === messageId);
+    if (idx !== -1) {
+        const next = {
+            ..._messagesCache[idx],
+            mediaUrl,
+            mediaData: { ..._messagesCache[idx].mediaData, synthesizedFromText },
+        };
+        _messagesCache[idx] = next;
+        dbPutMessage(next);
+        return;
+    }
+    try {
+        const stored = await chatDb.messages.get(messageId);
+        if (stored) {
+            await chatDb.messages.put({
+                ...stored,
+                mediaUrl,
+                mediaData: { ...stored.mediaData, synthesizedFromText },
+            });
+        }
+    } catch (err) {
+        console.warn("[ChatDB] persist voice audio failed:", err);
+    }
+}
+
 export function updateChatMessage(
     messageId: string,
     patch: Partial<Pick<ChatMessage, "content" | "mediaType" | "mediaUrl" | "mediaData">>,
@@ -1724,23 +1821,39 @@ export function updateChatMessage(
     return updated;
 }
 
-function replacePhotoDirectiveDescription(text: string | undefined, oldDescription: string, nextDescription: string): string | undefined {
+function replacePhotoDirectiveDescription(
+    text: string | undefined,
+    oldDescription: string,
+    nextDescription: string,
+    nextUseReferenceImage?: boolean,
+): string | undefined {
     const oldDesc = oldDescription.trim();
     const nextDesc = nextDescription.trim();
-    if (!text || !oldDesc || !nextDesc || oldDesc === nextDesc) return text;
+    // 原描述必须匹配到具体那一条照片标签才改：一条回复里可能有多张照片，
+    // 放宽成"原描述为空也改"会把其它照片的描述一并覆盖。
+    if (!text || !oldDesc || !nextDesc) return text;
 
     let changed = false;
     const withExplicitMode = text.replace(/\[照片[:：]\s*(使用参考图|不使用参考图)\s*[:：]\s*([^\]]+?)\]/g, (full, mode: string, desc: string) => {
         if (desc.trim() !== oldDesc) return full;
+        const targetMode = nextUseReferenceImage !== undefined
+            ? (nextUseReferenceImage ? "使用参考图" : "不使用参考图")
+            : mode;
+        if (targetMode === mode && desc.trim() === nextDesc) return full;
         changed = true;
-        return `[照片:${mode}:${nextDesc}]`;
+        return `[照片:${targetMode}:${nextDesc}]`;
     });
     if (changed) return withExplicitMode;
 
     return text.replace(/\[照片[:：]\s*([^\]]+?)\]/g, (full, desc: string) => {
         if (desc.trim() !== oldDesc) return full;
+        const targetMode = nextUseReferenceImage !== undefined
+            ? (nextUseReferenceImage ? "使用参考图" : "不使用参考图")
+            : undefined;
+        const replacement = targetMode ? `[照片:${targetMode}:${nextDesc}]` : `[照片:${nextDesc}]`;
+        if (replacement === full) return full;
         changed = true;
-        return `[照片:${nextDesc}]`;
+        return replacement;
     });
 }
 
@@ -1748,13 +1861,14 @@ export function syncChatGeneratedImagePromptText(
     messageId: string,
     oldDescription: string,
     nextDescription: string,
+    nextUseReferenceImage?: boolean,
 ): ChatMessage[] {
     const target = _messagesCache.find(m => m.id === messageId);
     if (!target) return [];
 
     const changed = new Map<string, ChatMessage>();
-    const targetNextRaw = replacePhotoDirectiveDescription(target.rawResponseText, oldDescription, nextDescription);
-    const targetNextEditable = replacePhotoDirectiveDescription(target.editableResponseText, oldDescription, nextDescription);
+    const targetNextRaw = replacePhotoDirectiveDescription(target.rawResponseText, oldDescription, nextDescription, nextUseReferenceImage);
+    const targetNextEditable = replacePhotoDirectiveDescription(target.editableResponseText, oldDescription, nextDescription, nextUseReferenceImage);
 
     if (target.rawResponseText && targetNextRaw && targetNextRaw !== target.rawResponseText && target.responseBatchId) {
         for (const msg of _messagesCache) {
@@ -1849,6 +1963,7 @@ export function replaceResponseBatchWithParts(
     parts: { content: string; mediaType?: ChatMessage["mediaType"]; mediaData?: ChatMessage["mediaData"] }[],
     options?: {
         statusPanel?: string;
+        statusRegionMode?: "custom";
         innerMonologue?: string;
         reasoningText?: string;
         stateValues?: StateValue[];
@@ -1890,7 +2005,11 @@ export function replaceResponseBatchWithParts(
         rawResponseText,
         responseRoundId: firstMessage.responseRoundId,
         editableResponseText: firstMessage.editableResponseText,
+        // 云消息身份必须跟着走：丢了它，微信云同步下一轮会把原文当成「还没导入过」
+        // 再导一遍，编辑后的版本和原文并存（编辑一次多一条）。
+        cloudSync: firstMessage.cloudSync,
         statusPanel: index === (options?.metaPartIndex ?? 0) ? options?.statusPanel : undefined,
+        statusRegionMode: index === (options?.metaPartIndex ?? 0) && options?.statusPanel ? options?.statusRegionMode : undefined,
         innerMonologue: index === (options?.metaPartIndex ?? 0) ? options?.innerMonologue : undefined,
         reasoningText: index === (options?.metaPartIndex ?? 0) ? options?.reasoningText : undefined,
         stateValues: index === (options?.metaPartIndex ?? 0) ? options?.stateValues : undefined,
@@ -1913,6 +2032,7 @@ export function replaceResponseBatchWithParts(
             responseBatchId,
             responseRoundId: firstMessage.responseRoundId,
             editableResponseText: firstMessage.editableResponseText,
+            cloudSync: firstMessage.cloudSync,
             followUpIndex: firstMessage.followUpIndex,
             senderCharacterId: firstMessage.senderCharacterId,
             senderName: firstMessage.senderName,
@@ -1939,7 +2059,20 @@ export function replaceResponseBatchWithParts(
         saveChatSessions(sessions);
     }
 
+    dispatchResponseBatchReplaced(sessionId, newMessages, rawResponseText);
     return newMessages;
+}
+
+/**
+ * 整批回复被编辑重建：这里不能走 CHAT_MESSAGE_PUSHED / CHAT_MESSAGES_DELETED
+ * （前者会被当成新消息新建云端对象，后者会把云端原件删掉），所以单独发一个事件，
+ * 由云同步侧「就地覆盖同一条云消息」。
+ */
+function dispatchResponseBatchReplaced(sessionId: string, messages: ChatMessage[], rawResponseText: string): void {
+    if (typeof window === "undefined" || messages.length === 0) return;
+    window.dispatchEvent(new CustomEvent(CHAT_RESPONSE_BATCH_REPLACED_EVENT, {
+        detail: { sessionId, messages, rawResponseText },
+    }));
 }
 
 export function replaceGroupResponseRound(
@@ -1953,6 +2086,7 @@ export function replaceGroupResponseRound(
         rawResponseText?: string;
         responseBatchId?: string;
         statusPanel?: string;
+        statusRegionMode?: "custom";
         innerMonologue?: string;
         reasoningText?: string;
         stateValues?: StateValue[];
@@ -1993,7 +2127,9 @@ export function replaceGroupResponseRound(
         rawResponseText: msg.rawResponseText,
         responseRoundId,
         editableResponseText,
+        cloudSync: firstMessage.cloudSync,
         statusPanel: msg.statusPanel,
+        statusRegionMode: msg.statusRegionMode,
         innerMonologue: msg.innerMonologue,
         reasoningText: msg.reasoningText,
         stateValues: msg.stateValues,
